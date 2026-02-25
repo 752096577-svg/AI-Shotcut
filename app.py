@@ -2,49 +2,56 @@ import streamlit as st
 import cv2
 import os
 import shutil
-import base64
 import numpy as np
-import concurrent.futures
-import time
-import requests  # 新增库
-from openai import OpenAI
+import requests
 from PIL import Image
-from io import BytesIO
 from scenedetect import detect, ContentDetector
 from fpdf import FPDF
-from tenacity import retry, stop_after_attempt, wait_exponential
-from sklearn.cluster import KMeans
 
-# --- 1. 初始化设置 ---
-st.set_page_config(page_title="AI 导演助手 Pro", layout="wide", page_icon="🎬")
+# --- 1. 基础配置 ---
+st.set_page_config(page_title="自动分镜提取工具 (本地版)", layout="wide", page_icon="🎬")
 
-# 尝试获取 API Key
-api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
-
-# --- 2. 自动下载字体逻辑 (解决上传限制问题) ---
+# 自动下载中文字体 (仅用于 PDF 标题，防止乱码)
 def check_and_download_font(font_name="simhei.ttf"):
-    """如果本地没有字体文件，则自动从网络下载"""
     if not os.path.exists(font_name):
-        with st.spinner(f"正在首次下载中文字体 ({font_name})...这可能需要几十秒..."):
+        with st.spinner(f"正在配置字体环境..."):
             try:
-                # 这是一个公开的 SimHei 字体下载源
                 url = "https://raw.githubusercontent.com/StellarCN/scp_zh/master/fonts/SimHei.ttf"
                 r = requests.get(url, allow_redirects=True)
                 with open(font_name, 'wb') as f:
                     f.write(r.content)
-                st.success("✅ 字体下载成功！")
-            except Exception as e:
-                st.error(f"字体下载失败: {e}。PDF 中文可能会乱码。")
-
-# 程序启动时检查一次字体
+            except:
+                pass
 check_and_download_font()
 
-# --- 3. PDF 生成类 ---
+# --- 2. 图像处理 (核心：三帧拼合) ---
+def create_motion_strip(img_paths, output_path):
+    """
+    将 [开始, 中间, 结束] 三张图拼合成一张宽图。
+    这是不需要 AI 也能看懂运镜的神器。
+    """
+    images = [Image.open(p) for p in img_paths]
+    widths, heights = zip(*(i.size for i in images))
+    
+    total_width = sum(widths)
+    max_height = max(heights)
+    
+    new_im = Image.new('RGB', (total_width, max_height))
+    
+    x_offset = 0
+    for im in images:
+        new_im.paste(im, (x_offset, 0))
+        x_offset += im.size[0]
+    
+    new_im.save(output_path)
+    return output_path
+
+# --- 3. PDF 生成类 (专为手写笔记优化) ---
 class DirectorReport(FPDF):
     def header(self):
         if self.page_no() == 1:
             self.set_font("Helvetica", 'B', 20)
-            self.cell(0, 15, "AI Storyboard Analysis Report", ln=True, align='C')
+            self.cell(0, 15, "Storyboard Motion Report", ln=True, align='C')
             self.ln(10)
 
     def footer(self):
@@ -55,162 +62,163 @@ class DirectorReport(FPDF):
 def create_pdf(results, font_path="simhei.ttf"):
     pdf = DirectorReport()
     
-    # 字体加载逻辑
-    has_chinese_font = False
+    # 字体设置
+    has_chinese = False
     if os.path.exists(font_path):
         try:
             pdf.add_font("CustomFont", "", font_path, uni=True)
-            pdf.set_font("CustomFont", size=11)
-            has_chinese_font = True
-        except Exception as e:
-            st.warning(f"字体加载错误: {e}")
-            pdf.set_font("Helvetica", size=11)
+            pdf.set_font("CustomFont", size=10)
+            has_chinese = True
+        except:
+            pdf.set_font("Helvetica", size=10)
     else:
-        # 如果下载失败，这里会作为保底
-        pdf.set_font("Helvetica", size=11)
+        pdf.set_font("Helvetica", size=10)
 
     for item in results:
         pdf.add_page()
         
-        # 标题栏
-        pdf.set_fill_color(240, 240, 240)
-        title_font = "CustomFont" if has_chinese_font else "Helvetica"
-        pdf.set_font(title_font, 'B', 12)
-        pdf.cell(0, 10, f"  Shot {item['id']} | Time: {item['time']}", ln=True, fill=True)
+        # 1. 标题行 (镜头号 + 时间 + 时长)
+        pdf.set_fill_color(230, 230, 230)
+        title_font = "CustomFont" if has_chinese else "Helvetica"
+        pdf.set_font(title_font, 'B', 14)
+        pdf.cell(0, 12, f"  Shot {item['id']} | Time: {item['time']} | Duration: {item['duration']:.1f}s", ln=True, fill=True)
         pdf.ln(5)
         
-        # 图片
+        # 2. 运镜拼图 (视觉核心)
         try:
-            pdf.image(item["path"], x=20, y=pdf.get_y(), w=170)
-            pdf.ln(100)
+            pdf.image(item["strip_path"], x=10, y=pdf.get_y(), w=190) 
+            pdf.ln(65) # 预留图片高度
         except:
-            pdf.cell(0, 10, "[Image Error]", ln=True)
-
-        # 文字内容
-        pdf.set_font(title_font, '', 10)
-        content = item['desc']
+            pdf.ln(65)
         
-        if not has_chinese_font:
-            content = "Chinese font missing. Text cannot be displayed."
-            
-        # 字符过滤
-        safe_text = content.replace('\n', '  ').encode('utf-8', 'ignore').decode('utf-8')
-        pdf.multi_cell(0, 7, txt=f"Director's Notes:\n{safe_text}")
+        # 3. 辅助标签
+        pdf.set_font("Helvetica", 'I', 8)
+        pdf.cell(63, 5, "Start", align='C')
+        pdf.cell(63, 5, "Mid", align='C')
+        pdf.cell(63, 5, "End", align='C')
+        pdf.ln(10)
+
+        # 4. 手写笔记区 (既然没有AI，就留白给导演手写)
+        pdf.set_font(title_font, '', 10)
+        pdf.set_draw_color(180, 180, 180) # 灰色线条
+        
+        pdf.cell(0, 8, "Notes / Action / Dialogue:", ln=True)
+        pdf.line(10, pdf.get_y(), 200, pdf.get_y()) # 横线
+        pdf.ln(8)
+        pdf.line(10, pdf.get_y(), 200, pdf.get_y()) # 横线
+        pdf.ln(8)
+        pdf.line(10, pdf.get_y(), 200, pdf.get_y()) # 横线
         
     return pdf.output(dest='S').encode('latin-1')
 
-# --- 4. 核心功能函数 ---
-def extract_color_palette(image_path, color_count=5):
-    try:
-        img = Image.open(image_path).convert('RGB')
-        img = img.resize((50, 50))
-        ar = np.asarray(img)
-        ar = ar.reshape(np.product(ar.shape[:2]), ar.shape[2])
-        kmeans = KMeans(n_clusters=color_count, n_init=5).fit(ar)
-        return kmeans.cluster_centers_.astype(int)
-    except:
-        return []
-
-def render_color_bar(colors):
-    cols = st.columns(len(colors))
-    for i, rgb in enumerate(colors):
-        hex_c = '#%02x%02x%02x' % tuple(rgb)
-        cols[i].markdown(f'<div style="background-color:{hex_c};height:20px;border-radius:4px;" title="{hex_c}"></div>', unsafe_allow_html=True)
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-def analyze_with_ai(client_obj, image_path):
-    with open(image_path, "rb") as f:
-        b64_img = base64.b64encode(f.read()).decode('utf-8')
-    time.sleep(np.random.uniform(0.1, 0.5))
-    response = client_obj.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": [
-            {"type": "text", "text": "你是电影摄影指导。请简练分析此画面的：1.构图与景别 2.光影色彩 3.叙事张力。请用中文回答。"},
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
-        ]}],
-        max_tokens=300
-    )
-    return response.choices[0].message.content
-
-# --- 5. Streamlit UI ---
+# --- 4. UI 界面 ---
 with st.sidebar:
-    st.header("🎛️ 控制台")
-    st.info(f"API 状态: {'✅ 已连接' if api_key else '❌ 未配置'}")
-    sensitivity = st.slider("切分灵敏度", 10.0, 50.0, 27.0)
-    uploaded_file = st.file_uploader("上传视频素材", type=["mp4", "mov"])
+    st.header("🎛️ 提取参数设置")
+    
+    st.info("💡 本模式无需 API Key，纯本地运算，速度极快。")
+    
+    # 核心参数
+    sensitivity = st.slider("切分灵敏度 (数值越小切得越碎)", 5.0, 50.0, 25.0)
+    min_duration = st.slider("防抖时长 (秒)", 0.1, 2.0, 1.0, help="短于此时间的画面变化不切分，防止运镜被切碎。")
+
+    uploaded_file = st.file_uploader("上传视频素材 (MP4/MOV)", type=["mp4", "mov"])
+    
     st.divider()
-    if st.button("🗑️ 清空重来"):
+    if st.button("🗑️ 清空所有数据"):
         if os.path.exists("shots"): shutil.rmtree("shots")
-        st.cache_data.clear()
         st.session_state.clear()
         st.rerun()
 
-st.title("🎬 AI 导演助手 Pro")
-
-if not api_key:
-    st.error("请先在 Streamlit Secrets 中配置 `OPENAI_API_KEY`")
-    st.stop()
-else:
-    client = OpenAI(api_key=api_key)
+# --- 5. 主程序逻辑 ---
+st.title("🎬 自动分镜提取工具 (纯净版)")
 
 if uploaded_file:
     video_path = "temp_video.mp4"
     with open(video_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
 
-    if st.button("🚀 开始智能拉片", use_container_width=True):
+    if st.button("🚀 开始提取分镜", use_container_width=True):
         output_dir = "shots"
         if os.path.exists(output_dir): shutil.rmtree(output_dir)
         os.makedirs(output_dir)
 
-        status_text = st.empty()
-        progress_bar = st.progress(0)
+        # A. 智能切分
+        st_text = st.empty()
+        st_bar = st.progress(0)
+        st_text.markdown("### ✂️ 正在逐帧分析视频...")
         
-        status_text.markdown("### ✂️ 正在进行智能切分...")
-        scenes = detect(video_path, ContentDetector(threshold=sensitivity))
+        # 计算帧数
+        min_scene_frames = int(min_duration * 24)
+        
+        # 调用 PySceneDetect
+        scenes = detect(video_path, ContentDetector(threshold=sensitivity, min_scene_len=min_scene_frames))
         cap = cv2.VideoCapture(video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS)
         
         shot_data = []
+        total_scenes = len(scenes)
+        
         for i, (start, end) in enumerate(scenes):
-            cap.set(cv2.CAP_PROP_POS_FRAMES, start.get_frames() + 3)
-            ret, frame = cap.read()
-            if ret:
-                img_path = f"{output_dir}/shot_{i+1:03d}.jpg"
-                cv2.imwrite(img_path, frame)
-                shot_data.append({"id": i+1, "path": img_path, "time": start.get_timecode(), "desc": "Waiting..."})
-        cap.release()
-        
-        status_text.markdown(f"### 🤖 AI 正在分析 {len(shot_data)} 个镜头...")
-        final_results = []
-        placeholders = [st.empty() for _ in shot_data]
-        
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-            future_to_shot = {executor.submit(analyze_with_ai, client, s["path"]): s for s in shot_data}
-            for i, future in enumerate(concurrent.futures.as_completed(future_to_shot)):
-                shot = future_to_shot[future]
-                try:
-                    res = future.result()
-                    shot["desc"] = res
-                    colors = extract_color_palette(shot["path"])
-                    with placeholders[shot["id"]-1].container():
-                        c1, c2 = st.columns([1, 2])
-                        with c1:
-                            st.image(shot["path"], use_container_width=True)
-                            render_color_bar(colors)
-                        with c2:
-                            st.markdown(f"**Shot {shot['id']}**")
-                            st.info(res)
-                    final_results.append(shot)
-                except Exception as e:
-                    st.error(f"分析出错: {e}")
-                progress_bar.progress((i + 1) / len(shot_data))
-        
-        final_results.sort(key=lambda x: x["id"])
-        st.session_state['results'] = final_results
-        status_text.success("✅ 完成！")
+            # 获取 Start, Mid, End 三帧
+            frames_idx = [
+                start.get_frames() + 5,
+                int((start.get_frames() + end.get_frames()) / 2),
+                end.get_frames() - 5
+            ]
+            
+            temp_paths = []
+            for fid in frames_idx:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, fid)
+                ret, frame = cap.read()
+                if ret:
+                    # 适当压缩图片，减小 PDF 体积
+                    frame = cv2.resize(frame, (0, 0), fx=0.6, fy=0.6)
+                    p = f"{output_dir}/temp_{i}_{fid}.jpg"
+                    cv2.imwrite(p, frame)
+                    temp_paths.append(p)
+            
+            # 只有凑齐 3 帧才生成记录
+            if len(temp_paths) == 3:
+                strip_path = f"{output_dir}/shot_{i+1:03d}_strip.jpg"
+                create_motion_strip(temp_paths, strip_path)
+                
+                duration = (end.get_frames() - start.get_frames()) / fps
+                
+                shot_data = [] # 修正变量作用域
+                # 重新读取 st.session_state 如果需要，或者直接追加
+                
+                # 实时展示
+                c1, c2 = st.columns([3, 1])
+                with c1:
+                    st.image(strip_path, caption=f"Shot {i+1}", use_container_width=True)
+                with c2:
+                    st.markdown(f"**时间码**: {start.get_timecode()}")
+                    st.markdown(f"**时长**: {duration:.1f}s")
+                
+                # 保存数据供 PDF 使用
+                st.session_state.setdefault('results', []).append({
+                    "id": i+1,
+                    "strip_path": strip_path,
+                    "time": start.get_timecode(),
+                    "duration": duration
+                })
+            
+            st_bar.progress((i + 1) / total_scenes)
 
+        cap.release()
+        st_text.success(f"✅ 提取完成！共识别 {len(scenes)} 个镜头。")
+
+# --- 6. 导出区 ---
 if 'results' in st.session_state and st.session_state['results']:
     st.divider()
-    # 这里的 font_path="simhei.ttf" 将使用刚才代码自动下载的文件
+    
+    # 纯净版 PDF 导出
     pdf_data = create_pdf(st.session_state['results'], font_path="simhei.ttf")
-    st.download_button("📄 下载 PDF 报告", data=bytes(pdf_data), file_name="Storyboard_Report.pdf", mime="application/pdf", use_container_width=True)
+    
+    st.download_button(
+        label="📄 下载分镜表 (PDF)",
+        data=bytes(pdf_data),
+        file_name="Storyboard_Motion_Report.pdf",
+        mime="application/pdf",
+        use_container_width=True
+    )
