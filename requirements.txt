@@ -1,10 +1,7 @@
 streamlit
 opencv-python-headless
 scenedetect
-openai
 Pillow
 numpy
 fpdf
-tenacity
-scikit-learn
 requests
